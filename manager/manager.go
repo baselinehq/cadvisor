@@ -389,6 +389,9 @@ func (m *manager) Stop() error {
 		}
 	}
 	m.quitChannels = make([]chan error, 0, 2)
+	if stopper, ok := m.fsInfo.(interface{ Stop() }); ok {
+		stopper.Stop()
+	}
 	nvm.Finalize()
 	perf.Finalize()
 	return nil

@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	mount "github.com/moby/sys/mountinfo"
 	"github.com/stretchr/testify/assert"
@@ -789,4 +791,38 @@ func TestRefreshDeviceToMountpoints(t *testing.T) {
 	// When the pod is unmounted the bind mount disappears again.
 	info.refreshDeviceToMountpoints(boot)
 	assert.NotContains(t, info.mountpointsForDevice(device), podMount, "refresh should drop the removed bind mount")
+}
+
+func TestRefreshSkipsEmptyMountpoint(t *testing.T) {
+	// Synthetic devicemapper-style partition with no mountpoint, alongside a
+	// real device. A rebuild from partitions must not surface an empty
+	// mountpoint for the synthetic device.
+	partitions := map[string]partition{
+		"docker-pool":  {fsType: "devicemapper"}, // no mountpoint
+		"/dev/nvme1n1": {fsType: "ext4", mountpoint: "/data", major: 259, minor: 1},
+	}
+	info := &RealFsInfo{partitions: partitions}
+	info.refreshDeviceToMountpoints(nil)
+
+	assert.Empty(t, info.mountpointsForDevice("docker-pool"), "synthetic device must not get an empty mountpoint")
+	assert.Equal(t, []string{"/data"}, info.mountpointsForDevice("/dev/nvme1n1"))
+}
+
+func TestMountpointRefreshStops(t *testing.T) {
+	info := &RealFsInfo{
+		partitions:          map[string]partition{},
+		deviceToMountpoints: map[string][]string{},
+		stopCh:              make(chan struct{}),
+	}
+
+	before := runtime.NumGoroutine()
+	info.startMountpointRefresh()
+	info.Stop()
+	info.Stop() // idempotent
+
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	assert.LessOrEqual(t, runtime.NumGoroutine(), before, "refresh goroutine should exit after Stop")
 }

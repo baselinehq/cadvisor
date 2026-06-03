@@ -105,6 +105,9 @@ type RealFsInfo struct {
 	// deviceToMountpoints maps each block device to all of its host-side mount
 	// paths, including bind mounts that processMounts de-duplicates away.
 	deviceToMountpoints map[string][]string
+	// stopCh terminates the background mountpoint refresher; closed by Stop.
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 func NewFsInfo(context Context) (FsInfo, error) {
@@ -134,6 +137,7 @@ func NewFsInfo(context Context) (FsInfo, error) {
 		fsUUIDToDeviceName:         fsUUIDToDeviceName,
 		excludedMountpointPrefixes: excluded,
 		deviceToMountpoints:        deviceToMountpoints,
+		stopCh:                     make(chan struct{}),
 	}
 
 	for _, mnt := range mounts {
@@ -173,15 +177,28 @@ func (i *RealFsInfo) startMountpointRefresh() {
 	go func() {
 		ticker := time.NewTicker(mountpointRefreshInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			mounts, err := readMountInfo()
-			if err != nil {
-				klog.Warningf("failed to refresh mountpoints: %v", err)
-				continue
+		for {
+			select {
+			case <-i.stopCh:
+				return
+			case <-ticker.C:
+				mounts, err := readMountInfo()
+				if err != nil {
+					klog.Warningf("failed to refresh mountpoints: %v", err)
+					continue
+				}
+				i.refreshDeviceToMountpoints(mounts)
 			}
-			i.refreshDeviceToMountpoints(mounts)
 		}
 	}()
+}
+
+// Stop terminates the background mountpoint refresher. Safe to call more than
+// once.
+func (i *RealFsInfo) Stop() {
+	i.stopOnce.Do(func() {
+		close(i.stopCh)
+	})
 }
 
 // refreshDeviceToMountpoints rebuilds the device→mountpoints map from a fresh
@@ -275,6 +292,12 @@ func buildDeviceToMountpoints(
 ) map[string][]string {
 	deviceToMountpoints := make(map[string][]string, len(partitions))
 	for device, partition := range partitions {
+		// Synthetic partitions (e.g. the devicemapper pool added by
+		// addDockerImagesLabel) carry no mountpoint; seeding "" would surface
+		// an empty AllMountpoints entry downstream.
+		if partition.mountpoint == "" {
+			continue
+		}
 		deviceToMountpoints[device] = []string{partition.mountpoint}
 	}
 
@@ -327,6 +350,9 @@ func isExcludedMountpoint(mountpoint string, excludedMountpointPrefixes []string
 }
 
 func appendUniqueMountpoint(deviceToMountpoints map[string][]string, device, mountpoint string) {
+	if mountpoint == "" {
+		return
+	}
 	for _, existing := range deviceToMountpoints[device] {
 		if existing == mountpoint {
 			return
