@@ -755,3 +755,38 @@ func TestBuildDeviceToMountpoints(t *testing.T) {
 
 	assert.Equal(t, expected, actual)
 }
+
+func TestRefreshDeviceToMountpoints(t *testing.T) {
+	const device = "/dev/nvme1n1"
+	globalMount := "/var/lib/kubelet/plugins/kubernetes.io/csi/ebs.csi.aws.com/abcd/globalmount"
+	podMount := "/var/lib/kubelet/pods/130e81c1/volumes/kubernetes.io~csi/pvc-90184541/mount"
+
+	// Boot snapshot: the CSI volume is only mounted at its globalmount; the
+	// per-pod bind mount has not appeared yet.
+	boot := []*mount.Info{
+		{Root: "/", Mountpoint: "/", Source: "/dev/sda1", FSType: "ext4", Major: 259, Minor: 0},
+		{Root: "/", Mountpoint: globalMount, Source: device, FSType: "ext4", Major: 259, Minor: 1},
+	}
+	partitions := processMounts(boot, nil)
+	info := &RealFsInfo{
+		partitions:          partitions,
+		deviceToMountpoints: buildDeviceToMountpoints(boot, nil, partitions),
+	}
+
+	// Without the refresh the pod bind mount is invisible, so no /pods/ path
+	// exists for the device and the enrichment labels can never populate.
+	for _, mp := range info.mountpointsForDevice(device) {
+		assert.NotContains(t, mp, "/pods/", "boot snapshot should not contain a pod bind mount")
+	}
+
+	// A pod scheduled after startup adds the per-pod bind mount.
+	mounted := append(boot[:len(boot):len(boot)], &mount.Info{
+		Root: "/", Mountpoint: podMount, Source: device, FSType: "ext4", Major: 259, Minor: 1,
+	})
+	info.refreshDeviceToMountpoints(mounted)
+	assert.Contains(t, info.mountpointsForDevice(device), podMount, "refresh should pick up the pod bind mount")
+
+	// When the pod is unmounted the bind mount disappears again.
+	info.refreshDeviceToMountpoints(boot)
+	assert.NotContains(t, info.mountpointsForDevice(device), podMount, "refresh should drop the removed bind mount")
+}

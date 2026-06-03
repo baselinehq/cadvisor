@@ -27,7 +27,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	mount "github.com/moby/sys/mountinfo"
 
@@ -50,6 +52,12 @@ const (
 	statBlockSize uint64 = 512
 	// The maximum number of `disk usage` tasks that can be running at once.
 	maxConcurrentOps = 20
+	// How often the host-side mountpoint topology is re-read from
+	// /proc/self/mountinfo. CSI volume bind mounts (…/pods/<uid>/volumes/…)
+	// appear after a pod is scheduled and change pod-uid on reschedule, so the
+	// boot-time snapshot misses them; without refresh the per-PVC enrichment
+	// labels (volume_name/volume_type) never populate.
+	mountpointRefreshInterval = time.Minute
 )
 
 // A pool for restricting the number of consecutive `du` and `find` tasks running.
@@ -89,17 +97,18 @@ type RealFsInfo struct {
 	dmsetup devicemapper.DmsetupClient
 	// fsUUIDToDeviceName is a map from the filesystem UUID to its device name.
 	fsUUIDToDeviceName map[string]string
+	// excludedMountpointPrefixes is retained so the periodic mountpoint refresh
+	// applies the same exclusions as the initial scan.
+	excludedMountpointPrefixes []string
+	// mu guards deviceToMountpoints, which the background refresher rebuilds.
+	mu sync.RWMutex
 	// deviceToMountpoints maps each block device to all of its host-side mount
 	// paths, including bind mounts that processMounts de-duplicates away.
 	deviceToMountpoints map[string][]string
 }
 
 func NewFsInfo(context Context) (FsInfo, error) {
-	fileReader, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return nil, err
-	}
-	mounts, err := mount.GetMountsFromReader(fileReader, nil)
+	mounts, err := readMountInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -118,12 +127,13 @@ func NewFsInfo(context Context) (FsInfo, error) {
 	deviceToMountpoints := buildDeviceToMountpoints(mounts, excluded, partitions)
 
 	fsInfo := &RealFsInfo{
-		partitions:          partitions,
-		labels:              make(map[string]string),
-		mounts:              make(map[string]mount.Info),
-		dmsetup:             devicemapper.NewDmsetupClient(),
-		fsUUIDToDeviceName:  fsUUIDToDeviceName,
-		deviceToMountpoints: deviceToMountpoints,
+		partitions:                 partitions,
+		labels:                     make(map[string]string),
+		mounts:                     make(map[string]mount.Info),
+		dmsetup:                    devicemapper.NewDmsetupClient(),
+		fsUUIDToDeviceName:         fsUUIDToDeviceName,
+		excludedMountpointPrefixes: excluded,
+		deviceToMountpoints:        deviceToMountpoints,
 	}
 
 	for _, mnt := range mounts {
@@ -138,7 +148,61 @@ func NewFsInfo(context Context) (FsInfo, error) {
 	klog.V(1).Infof("Filesystem UUIDs: %+v", fsInfo.fsUUIDToDeviceName)
 	klog.V(1).Infof("Filesystem partitions: %+v", fsInfo.partitions)
 	fsInfo.addSystemRootLabel(mounts)
+	fsInfo.startMountpointRefresh()
 	return fsInfo, nil
+}
+
+// readMountInfo parses the current host mount table from /proc/self/mountinfo.
+func readMountInfo() ([]*mount.Info, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			klog.V(4).Infof("closing /proc/self/mountinfo: %v", cerr)
+		}
+	}()
+	return mount.GetMountsFromReader(f, nil)
+}
+
+// startMountpointRefresh periodically re-reads the mount table and rebuilds
+// deviceToMountpoints so bind mounts created after startup (notably CSI volume
+// pod paths) are reflected in per-device AllMountpoints.
+func (i *RealFsInfo) startMountpointRefresh() {
+	go func() {
+		ticker := time.NewTicker(mountpointRefreshInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			mounts, err := readMountInfo()
+			if err != nil {
+				klog.Warningf("failed to refresh mountpoints: %v", err)
+				continue
+			}
+			i.refreshDeviceToMountpoints(mounts)
+		}
+	}()
+}
+
+// refreshDeviceToMountpoints rebuilds the device→mountpoints map from a fresh
+// mount table and swaps it in. partitions is the immutable boot snapshot, so
+// only devices present at startup are tracked; their bind-mount set is updated.
+func (i *RealFsInfo) refreshDeviceToMountpoints(mounts []*mount.Info) {
+	fresh := buildDeviceToMountpoints(mounts, i.excludedMountpointPrefixes, i.partitions)
+	i.mu.Lock()
+	i.deviceToMountpoints = fresh
+	i.mu.Unlock()
+}
+
+// mountpointsForDevice returns a copy of the host-side mountpoints for a device
+// under the read lock, safe against concurrent refresh.
+func (i *RealFsInfo) mountpointsForDevice(device string) []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	mps := i.deviceToMountpoints[device]
+	out := make([]string, len(mps))
+	copy(out, mps)
+	return out
 }
 
 // getFsUUIDToDeviceNameMap creates the filesystem uuid to device name map
@@ -486,7 +550,7 @@ func (i *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error
 							Minor:  uint(partition.minor),
 						}
 						fs.Mountpoint = partition.mountpoint
-						fs.AllMountpoints = i.deviceToMountpoints[device]
+						fs.AllMountpoints = i.mountpointsForDevice(device)
 						if val, ok := diskStatsMap[device]; ok {
 							fs.DiskStats = val
 						} else {
@@ -542,7 +606,7 @@ func (i *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error
 				Minor:  uint(partition.minor),
 			}
 			fs.Mountpoint = partition.mountpoint
-			fs.AllMountpoints = i.deviceToMountpoints[device]
+			fs.AllMountpoints = i.mountpointsForDevice(device)
 
 			if val, ok := diskStatsMap[device]; ok {
 				fs.DiskStats = val
