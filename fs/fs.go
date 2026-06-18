@@ -100,11 +100,17 @@ type RealFsInfo struct {
 	// excludedMountpointPrefixes is retained so the periodic mountpoint refresh
 	// applies the same exclusions as the initial scan.
 	excludedMountpointPrefixes []string
-	// mu guards deviceToMountpoints, which the background refresher rebuilds.
+	// mu guards deviceToMountpoints and dynamicPartitions, which the background
+	// refresher rebuilds from a fresh mount table.
 	mu sync.RWMutex
 	// deviceToMountpoints maps each block device to all of its host-side mount
 	// paths, including bind mounts that processMounts de-duplicates away.
 	deviceToMountpoints map[string][]string
+	// dynamicPartitions is the partition set rebuilt from the live mount table, so
+	// a device mounted after startup (a CSI PVC backing volume) is scanned without
+	// a restart. nil until the first refresh, before which the boot partitions
+	// snapshot is used.
+	dynamicPartitions map[string]partition
 	// stopCh terminates the background mountpoint refresher; closed by Stop.
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -170,9 +176,10 @@ func readMountInfo() ([]*mount.Info, error) {
 	return mount.GetMountsFromReader(f, nil)
 }
 
-// startMountpointRefresh periodically re-reads the mount table and rebuilds
-// deviceToMountpoints so bind mounts created after startup (notably CSI volume
-// pod paths) are reflected in per-device AllMountpoints.
+// startMountpointRefresh periodically re-reads the mount table and rebuilds the
+// partition set and deviceToMountpoints so devices and bind mounts created after
+// startup (notably CSI volume PVCs and their pod paths) are scanned and labelled
+// without a restart.
 func (i *RealFsInfo) startMountpointRefresh() {
 	go func() {
 		ticker := time.NewTicker(mountpointRefreshInterval)
@@ -187,7 +194,7 @@ func (i *RealFsInfo) startMountpointRefresh() {
 					klog.Warningf("failed to refresh mountpoints: %v", err)
 					continue
 				}
-				i.refreshDeviceToMountpoints(mounts)
+				i.refreshMountState(mounts)
 			}
 		}
 	}()
@@ -201,14 +208,35 @@ func (i *RealFsInfo) Stop() {
 	})
 }
 
-// refreshDeviceToMountpoints rebuilds the device→mountpoints map from a fresh
-// mount table and swaps it in. partitions is the immutable boot snapshot, so
-// only devices present at startup are tracked; their bind-mount set is updated.
-func (i *RealFsInfo) refreshDeviceToMountpoints(mounts []*mount.Info) {
-	fresh := buildDeviceToMountpoints(mounts, i.excludedMountpointPrefixes, i.partitions)
+// refreshMountState rebuilds the partition set and the device→mountpoints map
+// from a fresh mount table and swaps them in, so a device mounted after startup
+// (a CSI PVC backing volume) is scanned and labelled without a restart. The boot
+// partitions snapshot is read-only after startup; its devicemapper and label
+// entries, which are absent from the mount table, are carried over.
+func (i *RealFsInfo) refreshMountState(mounts []*mount.Info) {
+	parts := processMounts(mounts, i.excludedMountpointPrefixes)
+	for device, p := range i.partitions {
+		if _, ok := parts[device]; !ok {
+			parts[device] = p
+		}
+	}
+	dtm := buildDeviceToMountpoints(mounts, i.excludedMountpointPrefixes, parts)
 	i.mu.Lock()
-	i.deviceToMountpoints = fresh
+	i.dynamicPartitions = parts
+	i.deviceToMountpoints = dtm
 	i.mu.Unlock()
+}
+
+// currentPartitions returns the live partition set: the refreshed set once the
+// background refresher has run, otherwise the boot snapshot. A published map is
+// never mutated, so callers may range over the result without holding mu.
+func (i *RealFsInfo) currentPartitions() map[string]partition {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	if i.dynamicPartitions != nil {
+		return i.dynamicPartitions
+	}
+	return i.partitions
 }
 
 // mountpointsForDevice returns a copy of the host-side mountpoints for a device
@@ -521,7 +549,7 @@ func (i *RealFsInfo) GetLabelsForDevice(device string) ([]string, error) {
 }
 
 func (i *RealFsInfo) GetMountpointForDevice(dev string) (string, error) {
-	p, ok := i.partitions[dev]
+	p, ok := i.currentPartitions()[dev]
 	if !ok {
 		return "", fmt.Errorf("no partition info for device %q", dev)
 	}
@@ -537,7 +565,7 @@ func (i *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error
 	}
 	// statsCache stores cached filesystem stats by cache key for plugins that implement FsCachingPlugin
 	statsCache := make(map[string]Fs)
-	for device, partition := range i.partitions {
+	for device, partition := range i.currentPartitions() {
 		_, hasMount := mountSet[partition.mountpoint]
 		_, hasDevice := deviceSet[device]
 		if mountSet == nil || (hasMount && !hasDevice) {
@@ -746,7 +774,7 @@ func (i *RealFsInfo) GetDeviceInfoByFsUUID(uuid string) (*DeviceInfo, error) {
 	if !found {
 		return nil, ErrNoSuchDevice
 	}
-	p, found := i.partitions[deviceName]
+	p, found := i.currentPartitions()[deviceName]
 	if !found {
 		return nil, fmt.Errorf("cannot find device %q in partitions", deviceName)
 	}
@@ -783,7 +811,7 @@ func (i *RealFsInfo) GetDirFsDevice(dir string) (*DeviceInfo, error) {
 	// The type Dev in Stat_t is 32bit on mips.
 	major := major(uint64(buf.Dev)) // nolint: unconvert
 	minor := minor(uint64(buf.Dev)) // nolint: unconvert
-	for device, partition := range i.partitions {
+	for device, partition := range i.currentPartitions() {
 		if partition.major == major && partition.minor == minor {
 			return &DeviceInfo{device, major, minor}, nil
 		}

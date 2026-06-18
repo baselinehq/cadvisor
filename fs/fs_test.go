@@ -785,11 +785,11 @@ func TestRefreshDeviceToMountpoints(t *testing.T) {
 	mounted := append(boot[:len(boot):len(boot)], &mount.Info{
 		Root: "/", Mountpoint: podMount, Source: device, FSType: "ext4", Major: 259, Minor: 1,
 	})
-	info.refreshDeviceToMountpoints(mounted)
+	info.refreshMountState(mounted)
 	assert.Contains(t, info.mountpointsForDevice(device), podMount, "refresh should pick up the pod bind mount")
 
 	// When the pod is unmounted the bind mount disappears again.
-	info.refreshDeviceToMountpoints(boot)
+	info.refreshMountState(boot)
 	assert.NotContains(t, info.mountpointsForDevice(device), podMount, "refresh should drop the removed bind mount")
 }
 
@@ -802,10 +802,47 @@ func TestRefreshSkipsEmptyMountpoint(t *testing.T) {
 		"/dev/nvme1n1": {fsType: "ext4", mountpoint: "/data", major: 259, minor: 1},
 	}
 	info := &RealFsInfo{partitions: partitions}
-	info.refreshDeviceToMountpoints(nil)
+	info.refreshMountState(nil)
 
+	if _, ok := info.currentPartitions()["docker-pool"]; !ok {
+		t.Error("refresh must carry over the boot-only synthetic device")
+	}
 	assert.Empty(t, info.mountpointsForDevice("docker-pool"), "synthetic device must not get an empty mountpoint")
 	assert.Equal(t, []string{"/data"}, info.mountpointsForDevice("/dev/nvme1n1"))
+}
+
+func TestRefreshDiscoversNewDevice(t *testing.T) {
+	// Boot snapshot: only the root device is mounted.
+	boot := []*mount.Info{
+		{Root: "/", Mountpoint: "/", Source: "/dev/sda1", FSType: "ext4", Major: 259, Minor: 0},
+	}
+	partitions := processMounts(boot, nil)
+	info := &RealFsInfo{
+		partitions:          partitions,
+		deviceToMountpoints: buildDeviceToMountpoints(boot, nil, partitions),
+	}
+
+	const newDev = "/dev/nvme1n1"
+	if _, ok := info.currentPartitions()[newDev]; ok {
+		t.Fatal("new device must be absent before any refresh")
+	}
+
+	// A CSI PVC backing volume is mounted after startup; without rebuilding
+	// partitions its filesystem is never scanned until cadvisor restarts.
+	mounted := append(boot[:len(boot):len(boot)], &mount.Info{
+		Root: "/", Mountpoint: "/var/lib/kubelet/plugins/kubernetes.io/csi/ebs.csi.aws.com/abcd/globalmount",
+		Source: newDev, FSType: "ext4", Major: 259, Minor: 1,
+	})
+	info.refreshMountState(mounted)
+
+	p, ok := info.currentPartitions()[newDev]
+	if !ok {
+		t.Fatal("refresh must discover the new device so its filesystem is scanned")
+	}
+	assert.Equal(t, "ext4", p.fsType)
+	if _, ok := info.currentPartitions()["/dev/sda1"]; !ok {
+		t.Error("refresh must keep the boot device")
+	}
 }
 
 func TestMountpointRefreshStops(t *testing.T) {
