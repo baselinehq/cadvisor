@@ -100,8 +100,8 @@ type RealFsInfo struct {
 	// excludedMountpointPrefixes is retained so the periodic mountpoint refresh
 	// applies the same exclusions as the initial scan.
 	excludedMountpointPrefixes []string
-	// mu guards deviceToMountpoints and dynamicPartitions, which the background
-	// refresher rebuilds from a fresh mount table.
+	// mu guards mounts, deviceToMountpoints and dynamicPartitions, which the
+	// background refresher rebuilds from a fresh mount table.
 	mu sync.RWMutex
 	// deviceToMountpoints maps each block device to all of its host-side mount
 	// paths, including bind mounts that processMounts de-duplicates away.
@@ -208,22 +208,39 @@ func (i *RealFsInfo) Stop() {
 	})
 }
 
-// refreshMountState rebuilds the partition set and the device→mountpoints map
-// from a fresh mount table and swaps them in, so a device mounted after startup
-// (a CSI PVC backing volume) is scanned and labelled without a restart. The boot
-// partitions snapshot is read-only after startup; its devicemapper and label
-// entries, which are absent from the mount table, are carried over.
+// refreshMountState rebuilds the partition set, device→mountpoints map and mount
+// table from a fresh read so a device mounted after startup is scanned and a
+// detached one is dropped instead of ghosted. Synthetic boot entries (devicemapper pool,
+// labels) carry no mountpoint and never appear in the mount table, so they are
+// kept; real devices are present iff still mounted.
+//
+// The guard is on the raw read, not the filtered partitions: an empty mount
+// table means a failed read and is a no-op so state is not wiped, but a
+// non-empty table with zero supported partitions is still published.
 func (i *RealFsInfo) refreshMountState(mounts []*mount.Info) {
+	if len(mounts) == 0 {
+		return
+	}
 	parts := processMounts(mounts, i.excludedMountpointPrefixes)
 	for device, p := range i.partitions {
+		if p.mountpoint != "" {
+			continue
+		}
 		if _, ok := parts[device]; !ok {
 			parts[device] = p
 		}
 	}
 	dtm := buildDeviceToMountpoints(mounts, i.excludedMountpointPrefixes, parts)
+	// mountInfoFromDir walks an arbitrary dir up to its mountpoint, so it needs
+	// the full unfiltered table, not the supported-partition subset.
+	freshMounts := make(map[string]mount.Info, len(mounts))
+	for _, mnt := range mounts {
+		freshMounts[mnt.Mountpoint] = *mnt
+	}
 	i.mu.Lock()
 	i.dynamicPartitions = parts
 	i.deviceToMountpoints = dtm
+	i.mounts = freshMounts
 	i.mu.Unlock()
 }
 
@@ -237,6 +254,14 @@ func (i *RealFsInfo) currentPartitions() map[string]partition {
 		return i.dynamicPartitions
 	}
 	return i.partitions
+}
+
+// currentMounts returns the mountpoint→mount.Info table under the read lock. A
+// published map is never mutated, so callers may read it without holding mu.
+func (i *RealFsInfo) currentMounts() map[string]mount.Info {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.mounts
 }
 
 // mountpointsForDevice returns a copy of the host-side mountpoints for a device
@@ -782,7 +807,8 @@ func (i *RealFsInfo) GetDeviceInfoByFsUUID(uuid string) (*DeviceInfo, error) {
 }
 
 func (i *RealFsInfo) mountInfoFromDir(dir string) (*mount.Info, bool) {
-	mnt, found := i.mounts[dir]
+	mounts := i.currentMounts()
+	mnt, found := mounts[dir]
 	// try the parent dir if not found until we reach the root dir
 	// this is an issue on btrfs systems where the directory is not
 	// the subvolume
@@ -790,13 +816,13 @@ func (i *RealFsInfo) mountInfoFromDir(dir string) (*mount.Info, bool) {
 		pathdir, _ := filepath.Split(dir)
 		// break when we reach root
 		if pathdir == "/" {
-			mnt, found = i.mounts["/"]
+			mnt, found = mounts["/"]
 			break
 		}
 		// trim "/" from the new parent path otherwise the next possible
 		// filepath.Split in the loop will not split the string any further
 		dir = strings.TrimSuffix(pathdir, "/")
-		mnt, found = i.mounts[dir]
+		mnt, found = mounts[dir]
 	}
 	return &mnt, found
 }
