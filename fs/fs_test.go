@@ -873,6 +873,29 @@ func TestRefreshProceedsWhenNoSupportedPartitions(t *testing.T) {
 		"a non-empty read with no supported partitions must still drop the detached device")
 }
 
+func TestRefreshUpdatesMountTable(t *testing.T) {
+	// mountInfoFromDir must resolve a mount that appeared after startup, not only
+	// the boot snapshot.
+	const podPath = "/var/lib/kubelet/pods/abcd/volumes/kubernetes.io~csi/pvc-x/mount"
+	info := &RealFsInfo{
+		mounts: map[string]mount.Info{
+			"/": {Root: "/", Mountpoint: "/", Source: "/dev/sda1", FSType: "ext4", Major: 259, Minor: 0},
+		},
+	}
+
+	before, _ := info.mountInfoFromDir(podPath)
+	require.Equal(t, "/dev/sda1", before.Source, "before refresh the dir walks up to the root device")
+
+	info.refreshMountState([]*mount.Info{
+		{Root: "/", Mountpoint: "/", Source: "/dev/sda1", FSType: "ext4", Major: 259, Minor: 0},
+		{Root: "/", Mountpoint: podPath, Source: "/dev/nvme1n1", FSType: "ext4", Major: 259, Minor: 1},
+	})
+
+	mnt, found := info.mountInfoFromDir(podPath)
+	require.True(t, found)
+	assert.Equal(t, "/dev/nvme1n1", mnt.Source, "refresh must expose the post-boot mount to mountInfoFromDir")
+}
+
 func TestRefreshDiscoversNewDevice(t *testing.T) {
 	// Boot snapshot: only the root device is mounted.
 	boot := []*mount.Info{
