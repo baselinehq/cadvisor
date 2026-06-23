@@ -832,8 +832,7 @@ func TestRefreshSkipsEmptyMountpoint(t *testing.T) {
 }
 
 func TestRefreshIgnoresDegenerateRead(t *testing.T) {
-	// A successful mountinfo read always contains the root partition, so an empty
-	// read is a bad read and must not drop the known device set.
+	// An empty mount table means a failed read and must not drop known devices.
 	boot := []*mount.Info{
 		{Root: "/", Mountpoint: "/", Source: "/dev/sda1", FSType: "ext4", Major: 259, Minor: 0},
 		{Root: "/", Mountpoint: "/data", Source: "/dev/nvme1n1", FSType: "ext4", Major: 259, Minor: 1},
@@ -850,6 +849,28 @@ func TestRefreshIgnoresDegenerateRead(t *testing.T) {
 
 	assert.Contains(t, info.currentPartitions(), "/dev/nvme1n1",
 		"a degenerate mount read must not drop known devices")
+}
+
+func TestRefreshProceedsWhenNoSupportedPartitions(t *testing.T) {
+	// Zero supported partitions from a non-empty read is valid, not degenerate:
+	// the refresh must publish and drop the detached device, not skip.
+	const pvcDev = "/dev/nvme1n1"
+	boot := []*mount.Info{
+		{Root: "/", Mountpoint: "/data", Source: pvcDev, FSType: "ext4", Major: 259, Minor: 1},
+	}
+	partitions := processMounts(boot, nil)
+	info := &RealFsInfo{
+		partitions:          partitions,
+		deviceToMountpoints: buildDeviceToMountpoints(boot, nil, partitions),
+	}
+	require.Contains(t, info.currentPartitions(), pvcDev)
+
+	info.refreshMountState([]*mount.Info{
+		{Root: "/", Mountpoint: "/proc", Source: "proc", FSType: "proc"},
+	})
+
+	assert.NotContains(t, info.currentPartitions(), pvcDev,
+		"a non-empty read with no supported partitions must still drop the detached device")
 }
 
 func TestRefreshDiscoversNewDevice(t *testing.T) {
@@ -936,13 +957,11 @@ func reproFsByDevice(t *testing.T, info *RealFsInfo) map[string]Fs {
 	return byDevice
 }
 
-// TestReattachMetricLifecycle simulates node churn + PVC reattach end to end
-// through GetGlobalFsInfo (the path that backs container_fs_* on the root
-// cgroup), so a regression in mount-table refresh surfaces as a missing or
-// stale filesystem here rather than only in production.
+// TestReattachMetricLifecycle drives node churn + PVC reattach through
+// GetGlobalFsInfo, the path behind root-cgroup container_fs_*, so a refresh
+// regression surfaces here rather than only in production.
 func TestReattachMetricLifecycle(t *testing.T) {
 	t.Run("reattach after startup is discovered and emits stats", func(t *testing.T) {
-		// cadvisor starts before the workload's CSI volume is mounted.
 		boot := []*mount.Info{reproMount(reproRootDev, reproRootMnt, 0)}
 		info := reproFsInfo(boot)
 
@@ -950,8 +969,6 @@ func TestReattachMetricLifecycle(t *testing.T) {
 		require.NotContains(t, reproFsByDevice(t, info), pvcDev,
 			"PVC must be absent before it is mounted")
 
-		// PVC attaches after startup. Without rebuilding partitions on refresh
-		// its filesystem is never scanned until cadvisor restarts.
 		info.refreshMountState(append(boot[:len(boot):len(boot)], reproMount(pvcDev, reproPVCMntA, 1)))
 
 		fs, ok := reproFsByDevice(t, info)[pvcDev]
@@ -961,8 +978,6 @@ func TestReattachMetricLifecycle(t *testing.T) {
 	})
 
 	t.Run("detached boot PVC does not leave a stale filesystem", func(t *testing.T) {
-		// Node churn: cadvisor boots with the PVC already mounted, so the PVC
-		// device is in the boot snapshot.
 		const pvcDev = "/dev/nvme1n1"
 		boot := []*mount.Info{
 			reproMount(reproRootDev, reproRootMnt, 0),
@@ -971,8 +986,6 @@ func TestReattachMetricLifecycle(t *testing.T) {
 		info := reproFsInfo(boot)
 		require.Contains(t, reproFsByDevice(t, info), pvcDev, "boot PVC must be present initially")
 
-		// The pod moves off this node and the volume detaches: the PVC is gone
-		// from the live mount table.
 		info.refreshMountState([]*mount.Info{reproMount(reproRootDev, reproRootMnt, 0)})
 
 		assert.NotContains(t, reproFsByDevice(t, info), pvcDev,
@@ -980,7 +993,6 @@ func TestReattachMetricLifecycle(t *testing.T) {
 	})
 
 	t.Run("reattach that renumbers the device leaves no ghost", func(t *testing.T) {
-		// Node churn: boot snapshot has the volume on nvme1n1.
 		const oldDev, newDev = "/dev/nvme1n1", "/dev/nvme2n1"
 		boot := []*mount.Info{
 			reproMount(reproRootDev, reproRootMnt, 0),
@@ -988,8 +1000,8 @@ func TestReattachMetricLifecycle(t *testing.T) {
 		}
 		info := reproFsInfo(boot)
 
-		// AWS NVMe reassigns the device name on reattach; the same volume comes
-		// back at the same mountpoint under a new device.
+		// AWS NVMe renumbers the device on reattach: same volume, same
+		// mountpoint, new device name.
 		info.refreshMountState([]*mount.Info{
 			reproMount(reproRootDev, reproRootMnt, 0),
 			reproMount(newDev, reproPVCMntA, 2),
