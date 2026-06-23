@@ -52,6 +52,22 @@ func (p *testPlugin) ProcessMount(mnt *mount.Info) (bool, *mount.Info, error) {
 	return true, mnt, nil
 }
 
+const reproCapacity = uint64(100) << 30
+
+// reproStatsPlugin returns non-nil stats for "reprofs" so GetFsInfoForPath emits
+// a filesystem; testPlugin.GetStats returns nil, which it skips.
+type reproStatsPlugin struct{}
+
+func (reproStatsPlugin) Name() string                 { return "test-reprofs" }
+func (reproStatsPlugin) CanHandle(fsType string) bool { return fsType == "reprofs" }
+func (reproStatsPlugin) Priority() int                { return 100 }
+func (reproStatsPlugin) GetStats(string, PartitionInfo) (*FsStats, error) {
+	return &FsStats{Capacity: reproCapacity, Free: reproCapacity / 2, Available: reproCapacity / 2}, nil
+}
+func (reproStatsPlugin) ProcessMount(mnt *mount.Info) (bool, *mount.Info, error) {
+	return true, mnt, nil
+}
+
 func init() {
 	// Register test plugins for processMounts tests
 
@@ -111,6 +127,8 @@ func init() {
 			return true, &correctedMnt, nil
 		},
 	})
+
+	RegisterPlugin("test-reprofs", reproStatsPlugin{})
 }
 
 func TestMountInfoFromDir(t *testing.T) {
@@ -795,20 +813,43 @@ func TestRefreshDeviceToMountpoints(t *testing.T) {
 
 func TestRefreshSkipsEmptyMountpoint(t *testing.T) {
 	// Synthetic devicemapper-style partition with no mountpoint, alongside a
-	// real device. A rebuild from partitions must not surface an empty
-	// mountpoint for the synthetic device.
+	// real device. A rebuild from a live mount table must carry the synthetic
+	// device over without surfacing an empty mountpoint for it.
 	partitions := map[string]partition{
 		"docker-pool":  {fsType: "devicemapper"}, // no mountpoint
 		"/dev/nvme1n1": {fsType: "ext4", mountpoint: "/data", major: 259, minor: 1},
 	}
 	info := &RealFsInfo{partitions: partitions}
-	info.refreshMountState(nil)
+	info.refreshMountState([]*mount.Info{
+		{Root: "/", Mountpoint: "/data", Source: "/dev/nvme1n1", FSType: "ext4", Major: 259, Minor: 1},
+	})
 
 	if _, ok := info.currentPartitions()["docker-pool"]; !ok {
 		t.Error("refresh must carry over the boot-only synthetic device")
 	}
 	assert.Empty(t, info.mountpointsForDevice("docker-pool"), "synthetic device must not get an empty mountpoint")
 	assert.Equal(t, []string{"/data"}, info.mountpointsForDevice("/dev/nvme1n1"))
+}
+
+func TestRefreshIgnoresDegenerateRead(t *testing.T) {
+	// A successful mountinfo read always contains the root partition, so an empty
+	// read is a bad read and must not drop the known device set.
+	boot := []*mount.Info{
+		{Root: "/", Mountpoint: "/", Source: "/dev/sda1", FSType: "ext4", Major: 259, Minor: 0},
+		{Root: "/", Mountpoint: "/data", Source: "/dev/nvme1n1", FSType: "ext4", Major: 259, Minor: 1},
+	}
+	partitions := processMounts(boot, nil)
+	info := &RealFsInfo{
+		partitions:          partitions,
+		deviceToMountpoints: buildDeviceToMountpoints(boot, nil, partitions),
+	}
+	info.refreshMountState(boot)
+	require.Contains(t, info.currentPartitions(), "/dev/nvme1n1")
+
+	info.refreshMountState(nil)
+
+	assert.Contains(t, info.currentPartitions(), "/dev/nvme1n1",
+		"a degenerate mount read must not drop known devices")
 }
 
 func TestRefreshDiscoversNewDevice(t *testing.T) {
@@ -862,4 +903,101 @@ func TestMountpointRefreshStops(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	assert.LessOrEqual(t, runtime.NumGoroutine(), before, "refresh goroutine should exit after Stop")
+}
+
+const (
+	reproRootDev = "/dev/sda1"
+	reproRootMnt = "/"
+	reproPVCMntA = "/var/lib/kubelet/plugins/kubernetes.io/csi/ebs.csi.aws.com/vol-aaaa/globalmount"
+)
+
+func reproMount(source, mountpoint string, minor int) *mount.Info {
+	return &mount.Info{Root: "/", Mountpoint: mountpoint, Source: source, FSType: "reprofs", Major: 259, Minor: minor}
+}
+
+func reproFsInfo(boot []*mount.Info) *RealFsInfo {
+	partitions := processMounts(boot, nil)
+	return &RealFsInfo{
+		partitions:          partitions,
+		deviceToMountpoints: buildDeviceToMountpoints(boot, nil, partitions),
+		labels:              map[string]string{},
+		mounts:              map[string]mount.Info{},
+	}
+}
+
+func reproFsByDevice(t *testing.T, info *RealFsInfo) map[string]Fs {
+	t.Helper()
+	filesystems, err := info.GetGlobalFsInfo()
+	require.NoError(t, err)
+	byDevice := make(map[string]Fs, len(filesystems))
+	for _, fs := range filesystems {
+		byDevice[fs.DeviceInfo.Device] = fs
+	}
+	return byDevice
+}
+
+// TestReattachMetricLifecycle simulates node churn + PVC reattach end to end
+// through GetGlobalFsInfo (the path that backs container_fs_* on the root
+// cgroup), so a regression in mount-table refresh surfaces as a missing or
+// stale filesystem here rather than only in production.
+func TestReattachMetricLifecycle(t *testing.T) {
+	t.Run("reattach after startup is discovered and emits stats", func(t *testing.T) {
+		// cadvisor starts before the workload's CSI volume is mounted.
+		boot := []*mount.Info{reproMount(reproRootDev, reproRootMnt, 0)}
+		info := reproFsInfo(boot)
+
+		const pvcDev = "/dev/nvme1n1"
+		require.NotContains(t, reproFsByDevice(t, info), pvcDev,
+			"PVC must be absent before it is mounted")
+
+		// PVC attaches after startup. Without rebuilding partitions on refresh
+		// its filesystem is never scanned until cadvisor restarts.
+		info.refreshMountState(append(boot[:len(boot):len(boot)], reproMount(pvcDev, reproPVCMntA, 1)))
+
+		fs, ok := reproFsByDevice(t, info)[pvcDev]
+		require.True(t, ok, "reattached PVC must produce a filesystem after one refresh")
+		assert.Equal(t, reproPVCMntA, fs.Mountpoint, "PVC fs must carry the live mountpoint")
+		assert.Equal(t, reproCapacity, fs.Capacity, "PVC fs must carry stats from the live device")
+	})
+
+	t.Run("detached boot PVC does not leave a stale filesystem", func(t *testing.T) {
+		// Node churn: cadvisor boots with the PVC already mounted, so the PVC
+		// device is in the boot snapshot.
+		const pvcDev = "/dev/nvme1n1"
+		boot := []*mount.Info{
+			reproMount(reproRootDev, reproRootMnt, 0),
+			reproMount(pvcDev, reproPVCMntA, 1),
+		}
+		info := reproFsInfo(boot)
+		require.Contains(t, reproFsByDevice(t, info), pvcDev, "boot PVC must be present initially")
+
+		// The pod moves off this node and the volume detaches: the PVC is gone
+		// from the live mount table.
+		info.refreshMountState([]*mount.Info{reproMount(reproRootDev, reproRootMnt, 0)})
+
+		assert.NotContains(t, reproFsByDevice(t, info), pvcDev,
+			"detached PVC must not keep emitting a stale filesystem")
+	})
+
+	t.Run("reattach that renumbers the device leaves no ghost", func(t *testing.T) {
+		// Node churn: boot snapshot has the volume on nvme1n1.
+		const oldDev, newDev = "/dev/nvme1n1", "/dev/nvme2n1"
+		boot := []*mount.Info{
+			reproMount(reproRootDev, reproRootMnt, 0),
+			reproMount(oldDev, reproPVCMntA, 1),
+		}
+		info := reproFsInfo(boot)
+
+		// AWS NVMe reassigns the device name on reattach; the same volume comes
+		// back at the same mountpoint under a new device.
+		info.refreshMountState([]*mount.Info{
+			reproMount(reproRootDev, reproRootMnt, 0),
+			reproMount(newDev, reproPVCMntA, 2),
+		})
+
+		byDevice := reproFsByDevice(t, info)
+		assert.Contains(t, byDevice, newDev, "renumbered device must be scanned")
+		assert.NotContains(t, byDevice, oldDev,
+			"old device name must not survive as a ghost filesystem at the same mountpoint")
+	})
 }

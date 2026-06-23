@@ -210,12 +210,23 @@ func (i *RealFsInfo) Stop() {
 
 // refreshMountState rebuilds the partition set and the device→mountpoints map
 // from a fresh mount table and swaps them in, so a device mounted after startup
-// (a CSI PVC backing volume) is scanned and labelled without a restart. The boot
-// partitions snapshot is read-only after startup; its devicemapper and label
-// entries, which are absent from the mount table, are carried over.
+// (a CSI PVC backing volume) is scanned without a restart and a detached one is
+// dropped instead of ghosted. Synthetic boot entries (the devicemapper pool and
+// labels) carry no mountpoint and never appear in the mount table, so they are
+// carried over; real devices are present iff still mounted.
+//
+// An empty result is a degenerate read and left as a no-op: a successful
+// mountinfo read always contains the root partition, so zero partitions means a
+// bad read, not that every device vanished.
 func (i *RealFsInfo) refreshMountState(mounts []*mount.Info) {
 	parts := processMounts(mounts, i.excludedMountpointPrefixes)
+	if len(parts) == 0 {
+		return
+	}
 	for device, p := range i.partitions {
+		if p.mountpoint != "" {
+			continue
+		}
 		if _, ok := parts[device]; !ok {
 			parts[device] = p
 		}
