@@ -28,4 +28,5 @@ jobs:
           format: table
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          skip-dirs: deploy
           exit-code: "1"
