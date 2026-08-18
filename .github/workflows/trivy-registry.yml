@@ -1,0 +1,49 @@
+name: Trivy registry scan
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Log into ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve published image tag
+        id: image
+        run: |
+          image="ghcr.io/${{ github.repository }}"
+          for tag in "sha-$(git rev-parse --short=7 HEAD)" latest; do
+            if docker manifest inspect "$image:$tag" >/dev/null 2>&1; then
+              echo "ref=$image:$tag" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no published tag found for $image" >&2
+          exit 1
+
+      - name: Scan published image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
