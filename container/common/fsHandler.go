@@ -18,7 +18,9 @@
 package common
 
 import (
+	"errors"
 	"fmt"
+	iofs "io/fs"
 	"sync"
 	"time"
 
@@ -91,6 +93,16 @@ func (fh *realFsHandler) update() error {
 	// An error in one will not cause an early return, skipping others
 	fh.Lock()
 	defer fh.Unlock()
+	if isUnwalkable(rootErr) {
+		klog.V(2).Infof("fs: giving up on %q: %v", fh.rootfs, rootErr)
+		fh.rootfs = ""
+		rootErr = nil
+	}
+	if isUnwalkable(extraErr) {
+		klog.V(2).Infof("fs: giving up on %q: %v", fh.extraDir, extraErr)
+		fh.extraDir = ""
+		extraErr = nil
+	}
 	fh.lastUpdate = time.Now()
 	if fh.rootfs != "" && rootErr == nil {
 		fh.usage.InodeUsage = rootUsage.Inodes
@@ -113,6 +125,18 @@ func (fh *realFsHandler) update() error {
 	return nil
 }
 
+// A rootfs that is gone or unreadable stays that way for the life of the
+// handler, so retrying it forever only burns CPU and floods the log.
+func isUnwalkable(err error) bool {
+	return err != nil && (errors.Is(err, iofs.ErrNotExist) || errors.Is(err, iofs.ErrPermission))
+}
+
+func (fh *realFsHandler) hasDirs() bool {
+	fh.RLock()
+	defer fh.RUnlock()
+	return fh.rootfs != "" || fh.extraDir != ""
+}
+
 func (fh *realFsHandler) trackUsage() {
 	longOp := time.Second
 	for {
@@ -125,6 +149,9 @@ func (fh *realFsHandler) trackUsage() {
 			}
 		} else {
 			fh.period = fh.minPeriod
+		}
+		if !fh.hasDirs() {
+			return
 		}
 		duration := time.Since(start)
 		if duration > longOp {
