@@ -869,7 +869,7 @@ func GetDirUsage(dir string) (UsageInfo, error) {
 
 	rootInfo, err := os.Stat(dir)
 	if err != nil {
-		return usage, fmt.Errorf("could not stat %q to get inode usage: %v", dir, err)
+		return usage, fmt.Errorf("could not stat %q to get inode usage: %w", dir, err)
 	}
 
 	rootStat, ok := rootInfo.Sys().(*syscall.Stat_t)
@@ -888,7 +888,7 @@ func GetDirUsage(dir string) (UsageInfo, error) {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("unable to count inodes for part of dir %s: %s", dir, err)
+			return fmt.Errorf("unable to count inodes for part of dir %s: %w", dir, err)
 		}
 
 		// according to the docs, Sys can be nil
