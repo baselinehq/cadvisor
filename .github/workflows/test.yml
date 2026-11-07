@@ -4,7 +4,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go-versions: ['1.25']
+        go-versions: ['1.26']
         platform: [ubuntu-24.04]
         environment-variables: [build/config/plain.sh, build/config/libpfm4.sh, build/config/libipmctl.sh]
     runs-on: ${{ matrix.platform }}
@@ -33,20 +33,20 @@ jobs:
       matrix:
         include:
           # bookworm: all environment configs
-          - go-versions: '1.25'
+          - go-versions: '1.26'
             platform: ubuntu-24.04
             environment-variables: build/config/plain.sh
             debian-version: bookworm
-          - go-versions: '1.25'
+          - go-versions: '1.26'
             platform: ubuntu-24.04
             environment-variables: build/config/libpfm4.sh
             debian-version: bookworm
-          - go-versions: '1.25'
+          - go-versions: '1.26'
             platform: ubuntu-24.04
             environment-variables: build/config/libipmctl.sh
             debian-version: bookworm
           # trixie: only plain config
-          - go-versions: '1.25'
+          - go-versions: '1.26'
             platform: ubuntu-24.04
             environment-variables: build/config/plain.sh
             debian-version: trixie
@@ -72,7 +72,7 @@ jobs:
   test-integration-crio:
     strategy:
       matrix:
-        go-versions: ['1.25']
+        go-versions: ['1.26']
         platform: [ubuntu-24.04]
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
