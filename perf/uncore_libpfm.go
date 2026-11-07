@@ -394,7 +394,7 @@ func (c *uncoreCollector) registerEvent(eventInfo eventInfo, pmu pmu, leaderFile
 		groupFd, flags := leaderFileDescriptors[cpu], 0
 		fd, err := c.perfEventOpen(eventInfo.config, eventInfo.pid, int(cpu), groupFd, flags)
 		if err != nil {
-			return nil, fmt.Errorf("setting up perf event %#v failed: %q | (pmu: %q, groupFd: %d, cpu: %d)", eventInfo.config, err, pmu, groupFd, cpu)
+			return nil, fmt.Errorf("setting up perf event %#v failed: %q | (pmu: %q, groupFd: %d, cpu: %d)", eventInfo.config, err, pmu.name, groupFd, cpu)
 		}
 		perfFile := os.NewFile(uintptr(fd), eventInfo.name)
 		if perfFile == nil {
