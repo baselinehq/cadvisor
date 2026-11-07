@@ -36,10 +36,10 @@ func TestParseDMStatus(t *testing.T) {
 			t.Errorf("parseDMStatus(%q) expected error", tt.dmStatus)
 		}
 		if used != tt.used {
-			t.Errorf("parseDMStatus(%q) wrong used value => %q, want %q", tt.dmStatus, used, tt.used)
+			t.Errorf("parseDMStatus(%q) wrong used value => %d, want %d", tt.dmStatus, used, tt.used)
 		}
 		if total != tt.total {
-			t.Errorf("parseDMStatus(%q) wrong total value => %q, want %q", tt.dmStatus, total, tt.total)
+			t.Errorf("parseDMStatus(%q) wrong total value => %d, want %d", tt.dmStatus, total, tt.total)
 		}
 	}
 }
@@ -63,13 +63,13 @@ func TestParseDMTable(t *testing.T) {
 			t.Errorf("ParseDMTable(%q) expected error", tt.dmTable)
 		}
 		if major != tt.major {
-			t.Errorf("ParseDMTable(%q) wrong major value => %q, want %q", tt.dmTable, major, tt.major)
+			t.Errorf("ParseDMTable(%q) wrong major value => %d, want %d", tt.dmTable, major, tt.major)
 		}
 		if minor != tt.minor {
-			t.Errorf("ParseDMTable(%q) wrong minor value => %q, want %q", tt.dmTable, minor, tt.minor)
+			t.Errorf("ParseDMTable(%q) wrong minor value => %d, want %d", tt.dmTable, minor, tt.minor)
 		}
 		if dataBlkSize != tt.dataBlkSize {
-			t.Errorf("ParseDMTable(%q) wrong dataBlkSize value => %q, want %q", tt.dmTable, dataBlkSize, tt.dataBlkSize)
+			t.Errorf("ParseDMTable(%q) wrong dataBlkSize value => %d, want %d", tt.dmTable, dataBlkSize, tt.dataBlkSize)
 		}
 	}
 }
