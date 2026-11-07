@@ -51,7 +51,7 @@ jobs:
           # Create a Docker container with the appropriate architecture
           docker run --rm -v ${PWD}:/go/src/github.com/google/cadvisor \
             --platform linux/${{ matrix.arch }} \
-            golang:1.25 \
+            golang:1.26 \
             /bin/bash -c "cd /go/src/github.com/google/cadvisor && GOARCH=${{ matrix.arch }} OUTPUT_NAME_WITH_ARCH=true VERSION=${VERSION} GO_FLAGS='-buildvcs=false -tags=netgo' GO_CGO_ENABLED=0 ./build/build.sh"
 
       - name: Generate SHA256 checksums
